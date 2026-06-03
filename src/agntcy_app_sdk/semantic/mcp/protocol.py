@@ -17,6 +17,7 @@ from mcp.shared.message import SessionMessage
 
 from contextlib import asynccontextmanager
 import asyncio
+import itertools
 import anyio
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 
@@ -232,6 +233,12 @@ class MCPProtocol:
             )
 
         self._response_futures: dict[str, asyncio.Future] = {}
+        # Globally-unique correlation ids. The client-supplied JSON-RPC id is
+        # only unique within a single client session and resets to 0 per
+        # session, so concurrent clients collide on the same id and overwrite
+        # each other's futures. Remap every inbound request to a process-unique
+        # id and restore the original on the way out.
+        self._id_counter = itertools.count(1)
 
         async def reply_method(session_message: SessionMessage):
             request_id = session_message.message.root.id
@@ -284,9 +291,21 @@ class MCPProtocol:
         # Deserialize the incoming JSON-RPC message
         rpc_message = types.JSONRPCMessage.model_validate_json(message.payload.decode())
 
+        # Notifications carry no id and expect no response - forward untouched.
+        original_id = getattr(rpc_message.root, "id", None)
+        if original_id is None:
+            await self.read_stream_writer.send(SessionMessage(rpc_message))
+            return None
+
+        # Remap to a process-unique id so concurrent clients can't collide on
+        # the same session-local JSON-RPC id (which would overwrite futures and
+        # time out all but the last writer).
+        unique_id = f"{id(self)}-{next(self._id_counter)}"
+        rpc_message.root.id = unique_id
+
         # Create a future to track the response for this request
         future = asyncio.get_event_loop().create_future()
-        self._response_futures[rpc_message.root.id] = future
+        self._response_futures[unique_id] = future
 
         # Route the message to the MCP server via the read stream
         session_message = SessionMessage(rpc_message)
@@ -295,6 +314,9 @@ class MCPProtocol:
         try:
             # Wait for the server's response with a timeout
             response = await asyncio.wait_for(future, timeout=timeout)
+
+            # Restore the client's original id before replying.
+            response.message.root.id = original_id
 
             # Serialize the response back to JSON-RPC format
             return Message(
@@ -309,14 +331,16 @@ class MCPProtocol:
             )
         except asyncio.TimeoutError:
             # Handle timeout - log and raise appropriate error
-            logger.warning(f"Timeout waiting for response for id={rpc_message.root.id}")
-            raise TimeoutError(
-                f"Timeout waiting for response for id={rpc_message.root.id}"
-            )
+            logger.warning(f"Timeout waiting for response for id={original_id}")
+            raise TimeoutError(f"Timeout waiting for response for id={original_id}")
         except Exception as e:
             # Handle other errors with proper logging
             logger.error(f"Error waiting for response: {e}")
             raise e
+        finally:
+            # Always clean up bookkeeping (also fixes the original leak where
+            # entries were never removed from _response_futures).
+            self._response_futures.pop(unique_id, None)
 
     def message_translator(self, request: Any) -> Message:
         """
